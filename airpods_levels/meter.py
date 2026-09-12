@@ -61,6 +61,15 @@ def pretty_device_name(name):
     return name.strip() or None
 
 
+def _same_device(a, b):
+    """Tolerant match: PortAudio truncates long device names, so one side can
+    legitimately be a prefix of the other."""
+    if not a or not b:
+        return False
+    a, b = a.strip().lower(), b.strip().lower()
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
 class LoopbackMeter:
     """Runs in the background and exposes the latest A-weighted dBFS."""
 
@@ -71,6 +80,7 @@ class LoopbackMeter:
         self._device_name = None
         self._error = None
         self._stop = threading.Event()
+        self._restart = threading.Event()
         self._thread = None
 
     # -- public -------------------------------------------------------------
@@ -87,6 +97,16 @@ class LoopbackMeter:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+    def request_restart(self):
+        """Reopen on the current default output.
+
+        The capture loop only ever left on an error, so when the headphones
+        went away Windows moved the default output elsewhere, the loop bound
+        itself to that device, and reading it kept succeeding forever. It
+        never came back when the headphones returned.
+        """
+        self._restart.set()
 
     @property
     def dbfs_a(self):
@@ -147,11 +167,12 @@ class LoopbackMeter:
 
                 name = dev["name"].replace(" [Loopback]", "")
                 history = deque(maxlen=max(1, int(SMOOTH_SEC / BLOCK_SEC)))
+                self._restart.clear()
                 with self._lock:
                     self._device_name = name
                     self._error = None
 
-                while not self._stop.is_set():
+                while not self._stop.is_set() and not self._restart.is_set():
                     raw = stream.read(chunk, exception_on_overflow=False)
                     data = np.frombuffer(raw, dtype=np.float32)
                     if channels > 1:
@@ -187,7 +208,7 @@ class LoopbackMeter:
                     self._dbfs_a = None
                     self._error = str(exc)
                 # the output device probably changed; back off and retry
-                self._stop.wait(1.5)
+                self._stop.wait(0.8)
             finally:
                 try:
                     if stream is not None:
@@ -253,6 +274,7 @@ class SplEstimator:
         self.volume = EndpointVolume()
         self.device = devices.Device("")
         self._known_name = None
+        self._last_restart = 0.0
 
     def start(self):
         self.meter.start()
@@ -265,6 +287,20 @@ class SplEstimator:
         dbfs = self.meter.dbfs_a
         vol_db, vol_pct, muted, name = self.volume.read()
         device = pretty_device_name(name or self.meter.device_name)
+
+        # The endpoint API sees the default output switch immediately; the
+        # capture thread cannot. Compare the two and tell it to reopen when
+        # they drift apart - this is what makes unplugging and replugging
+        # headphones work.
+        capturing = pretty_device_name(self.meter.device_name)
+        if name and capturing and not _same_device(device, capturing):
+            # rate limited: PortAudio truncates device names on some systems,
+            # and a permanent mismatch must degrade to an occasional reopen
+            # rather than spin
+            now = time.time()
+            if now - self._last_restart > 3.0:
+                self._last_restart = now
+                self.meter.request_restart()
 
         # re-identify only when the output actually changes: the lookup walks
         # the registry and has no business running on every frame
