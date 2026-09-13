@@ -150,6 +150,8 @@ SHADOW_PAD = 20   # room around the panel for the drop shadow
 # The shell is near-black on purpose: it plays systemGroupedBackground, and
 # the content cards sit on top of it as the lighter secondary fill. Getting
 # that order backwards is what makes grouped content stop reading as grouped.
+# Now the geometry base for GLASS_SIDEBAR rather than a surface of its own:
+# the exposure window went light, so nothing ships this dark shell.
 GLASS_WINDOW = dict(GLASS,
                     bezel=16.0, thickness=22.0, blur=11.0, refraction=1.5,
                     specular=0.62, tint=(0.03, 0.03, 0.04), tint_alpha=0.50,
@@ -161,9 +163,31 @@ GLASS_WINDOW = dict(GLASS,
                     rim_gain=0.13, edge_shade=0.26, rim_ambient=0.32,
                     # geometry is built once, so it can be evaluated finer
                     supersample=3,
+                    # 454 kpx of surface, seven times the panel, and all of
+                    # it but the sidebar strip sits under an opaque fill. The
+                    # interior tone runs a step coarser; none of it shows.
+                    interior_scale=2,
                     # and the veil thins towards the edge, where the lens is
                     bezel_clarity=0.78,
                     shadow=0.46, shadow_blur=26.0, shadow_lift=8.0)
+
+# The exposure window's light surface, after Finder and Music. It is rendered
+# once over a flat field rather than over the desktop - see
+# HistoryWindow._build_shell - so what these values settle is a tone and an
+# edge, not a live material. `blur` is deliberately absent: over a uniform
+# field it is a no-op, and carrying a value that does nothing invites someone
+# to tune it. The geometry is GLASS_WINDOW's.
+GLASS_SIDEBAR = dict(GLASS_WINDOW,
+                     # 0.84 where the dark window used 0.50. The tone has to
+                     # land light with only the flat field underneath it.
+                     tint=(0.96, 0.96, 0.97), tint_alpha=0.84,
+                     tint_polarity=((0.88, 0.88, 0.90), (0.99, 0.99, 1.00)),
+                     adaptive=0.10, brightness=1.0, saturation=1.0,
+                     # a light window's edge is a thin bright line and a soft
+                     # shadow, not the deep bevel a dark one can carry
+                     specular=0.30, rim_gain=0.16, rim_ambient=0.42,
+                     edge_shade=0.10, bezel_clarity=0.70,
+                     shadow=0.30)
 
 SHADOW = QColor(0, 0, 0, 130)
 
@@ -393,14 +417,28 @@ class PanelRenderer:
         """
         h, w = self.h, self.w
         self.h2, self.w2 = h // 2, w // 2
-        sh = self.shade[:self.h2 * 2, :self.w2 * 2]
-        self.shade_half = sh.reshape(self.h2, 2, self.w2, 2).mean((1, 3))
 
+        # The interior can be coarser still than the band source. Halving is
+        # what the bezel needs, because it is the warp source; the interior is
+        # only a blurred backdrop under a smooth shade. `interior_scale` is
+        # that extra divisor, on top of the half the band already works at.
+        # Worth about 2 ms of 24 on the exposure window - the tone arithmetic
+        # is the only pass that scales with it, and it was smaller than the
+        # blur, the shrink and the band warp that do not.
+        self.qi = max(1, int(self.g.get("interior_scale", 1)))
+        self.hi, self.wi = self.h2 // self.qi, self.w2 // self.qi
+        self.fi = 2 * self.qi          # interior grid -> full resolution
+
+        def coarse(field):
+            f = self.fi
+            a = field[:self.hi * f, :self.wi * f].astype(np.float32)
+            return a.reshape(self.hi, f, self.wi, f).mean((1, 3))
+
+        self.shade_half = coarse(self.shade)
         # The scrim is applied twice: once as a darkening folded into `shade`,
         # and once as a tone added back on top (see glass_image). The split
         # renderer needs the add-back at both resolutions.
-        sc = self.scrim[:self.h2 * 2, :self.w2 * 2].astype(np.float32)
-        self.scrim_half = sc.reshape(self.h2, 2, self.w2, 2).mean((1, 3))
+        self.scrim_half = coarse(self.scrim)
 
         # Write band: only pixels the displacement actually moves, i.e. the
         # bezel itself. Beyond it the field is zero and the half-res interior
@@ -485,7 +523,20 @@ class PanelRenderer:
                                     truncate=2.5)
         blurred = small.copy()          # warp source, before any tinting
 
-        # --- tone, still at half resolution --------------------------------
+        # The bezel warps `blurred` and needs it at half; the interior only
+        # gets a flat tone, so on a large surface it runs one step coarser
+        # again. Every pass below is then over a quarter of the pixels.
+        if self.qi > 1:
+            q, hi, wi = self.qi, self.hi, self.wi
+            acc = small[0:hi * q:q, 0:wi * q:q].copy()
+            for oy in range(q):
+                for ox in range(q):
+                    if oy or ox:
+                        acc += small[oy:hi * q:q, ox:wi * q:q]
+            small = acc
+            small *= np.float32(1.0 / (q * q))
+
+        # --- tone, at the interior resolution ------------------------------
         tint = g["tint"]
         lum = float(0.2126 * small[..., 0].mean()
                     + 0.7152 * small[..., 1].mean()
@@ -525,14 +576,16 @@ class PanelRenderer:
         np.clip(small, 0, 255, out=small)
 
         # bytes while still small, then expanded straight into the canvas
-        tile = np.repeat(np.repeat(small.astype(np.uint8), 2, axis=0), 2,
+        f = self.fi
+        tile = np.repeat(np.repeat(small.astype(np.uint8), f, axis=0), f,
                          axis=1)
+        th, tw = self.hi * f, self.wi * f
         dst = self.canvas[pad:pad + h, pad:pad + w, :3]
-        dst[:h2 * 2, :w2 * 2] = tile
-        if h2 * 2 < h:
-            dst[h2 * 2:, :w2 * 2] = tile[-1:, :]
-        if w2 * 2 < w:
-            dst[:, w2 * 2:] = dst[:, w2 * 2 - 1:w2 * 2]
+        dst[:th, :tw] = tile
+        if th < h:
+            dst[th:, :tw] = tile[-1:, :]
+        if tw < w:
+            dst[:, tw:] = dst[:, tw - 1:tw]
 
         # --- bezel band, full resolution -----------------------------------
         for job in self.band_jobs:

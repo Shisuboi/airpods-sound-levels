@@ -14,7 +14,6 @@ read as Apple rather than as an imitation:
   - concentric radii: window 26, content inset 16, cards 10
 """
 
-import time
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -23,7 +22,6 @@ from PySide6.QtCore import (Qt, QRectF, QRect, QTimer, QVariantAnimation,
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from . import glass as lg
 from . import panel as pnl
 from . import i18n
 from .i18n import t
@@ -36,35 +34,52 @@ RADIUS = 26              # macOS Tahoe toolbar-window radius
 INSET = 16
 CARD_RADIUS = RADIUS - INSET     # concentric
 PAD = pnl.SHADOW_PAD
-GLASS_MS = 33                    # floor; the real pace follows the work
 
-WDA_NONE = 0x00000000
-WDA_EXCLUDEFROMCAPTURE = 0x00000011
+# The flat field the shell is rendered over. Chosen so the sidebar lands on
+# Finder's tone once the material's tint is applied on top of it.
+SHELL_LEVEL = 220
 
 TL_CLOSE = QColor("#FF5F57")
 TL_MIN = QColor("#FEBC2E")
 TL_ZOOM = QColor("#28C840")
 TL_GLYPH = QColor(0, 0, 0, 150)
 
-LABEL = QColor(255, 255, 255)
-LABEL2 = QColor(235, 235, 245, 158)
-LABEL3 = QColor(235, 235, 245, 115)
-LABEL4 = QColor(235, 235, 245, 76)
+# Light, after Finder and Music. Two rules carry the whole window:
+#
+#   - the material lives in the sidebar and nowhere else. The content pane is
+#     an opaque surface, because refracting the desktop under a page of
+#     numbers and a chart makes the content fight the wallpaper - the same
+#     reason Finder does not do it behind a file list. The boundary between
+#     the two is a change of tone plus a hairline, never a cast shadow.
+#   - elevation inverts. In the dark a raised surface was a lighter fill with
+#     a bright top edge; in the light it is a white card on a grey ground,
+#     carried by a soft shadow alone. Keeping the white top edge here would
+#     read as a scuff, so the highlight goes to zero.
+LABEL = QColor(0, 0, 0, 224)             # primary
+LABEL2 = QColor(60, 60, 67, 168)         # secondary
+LABEL3 = QColor(60, 60, 67, 122)         # tertiary
+LABEL4 = QColor(60, 60, 67, 86)          # quaternary
+ON_ACCENT = QColor(255, 255, 255)        # text over a filled accent
 
-# The floor. Kept translucent on purpose: at 222 it sealed the window shut
-# and the refracted desktop never showed anywhere except the sidebar strip.
-DETAIL_FILL = QColor(18, 18, 21, 148)
-CARD = QColor(255, 255, 255, 34)        # primary content, lifted highest
-TILE = QColor(255, 255, 255, 19)        # secondary, one step down
-SELECTED = QColor(10, 132, 255, 210)
-HOVER = QColor(255, 255, 255, 24)
-HAIRLINE = QColor(255, 255, 255, 18)
+DETAIL_FILL = QColor(242, 242, 245)     # the ground
+CARD = QColor(255, 255, 255)            # primary content, lifted highest
+TILE = QColor(255, 255, 255)            # secondary, one step down
+SELECTED = QColor(10, 132, 255, 235)
+HOVER = QColor(0, 0, 0, 16)
+HAIRLINE = QColor(0, 0, 0, 26)
 
-# Elevation ladder. Height is the ranking, and in dark mode height reads as
-# a lighter fill plus a brighter top edge; the shadow only sharpens the join.
-ELEV_CARD = dict(blur=15.0, alpha=0.52, dy=5, highlight=34)
-ELEV_TILE = dict(blur=8.0, alpha=0.38, dy=3, highlight=20)
-ELEV_ROW = dict(blur=5.0, alpha=0.32, dy=2, highlight=26)
+ELEV_CARD = dict(blur=15.0, alpha=0.13, dy=4, highlight=0)
+ELEV_TILE = dict(blur=8.0, alpha=0.10, dy=2, highlight=0)
+ELEV_ROW = dict(blur=5.0, alpha=0.12, dy=1, highlight=0)
+
+# The tier accents are the system colours, but the panel's are the dark-mode
+# set and several of them fail on white - #FFD60A in particular all but
+# disappears. These are the light-mode counterparts, with the yellow deepened
+# rather than swapped for orange so the tier keeps its meaning across the two
+# surfaces.
+OK_C = QColor("#34C759")
+LOUD_C = QColor("#E6A700")
+RISK_C = QColor("#FF3B30")
 
 
 TYPE = {
@@ -91,15 +106,20 @@ def _text(p, rect, flags, text, color):
 
 def dose_color(dose):
     if dose >= 1.0:
-        return pnl.RED
+        return RISK_C
     if dose >= 0.5:
-        return pnl.YELLOW
-    return pnl.GREEN
+        return LOUD_C
+    return OK_C
 
 
 def level_color(spl):
-    _, accent, _ = pnl.level_style(spl)
-    return accent or pnl.GREEN
+    if spl is None:
+        return OK_C
+    if spl >= pnl.HIGH_THRESHOLD:
+        return RISK_C
+    if spl >= pnl.LOUD_THRESHOLD:
+        return LOUD_C
+    return OK_C
 
 
 class HistoryWindow(QWidget):
@@ -112,6 +132,7 @@ class HistoryWindow(QWidget):
         self.day = datetime.now().date()
         self._drag = None
         self._glass = None
+        self._content = None
         self._pressed = None
         self._hover = None
         self._lights_hot = False
@@ -129,22 +150,6 @@ class HistoryWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.reload)
         self.timer.start(5000)
-
-        # Self-pacing: a fixed interval shorter than the work saturates the
-        # event loop and frames get dropped, which reads far worse than a
-        # lower steady rate. Each tick schedules the next from what the last
-        # one actually cost.
-        self.glass_timer = QTimer(self)
-        self.glass_timer.setSingleShot(True)
-        self.glass_timer.timeout.connect(self._tick_glass)
-        self._last_ms = GLASS_MS
-
-    def _tick_glass(self):
-        t0 = time.perf_counter()
-        self.refresh_glass(False)
-        self._last_ms = (time.perf_counter() - t0) * 1000.0
-        if self.isVisible():
-            self.glass_timer.start(int(max(GLASS_MS, self._last_ms * 1.25)))
 
     # -- geometry -----------------------------------------------------------
 
@@ -166,68 +171,43 @@ class HistoryWindow(QWidget):
         w = self._w()
         if w not in self._renderers:
             self._renderers[w] = pnl.PanelRenderer(w, H, RADIUS,
-                                                   glass=pnl.GLASS_WINDOW,
+                                                   glass=pnl.GLASS_SIDEBAR,
                                                    pad=PAD)
         self.renderer = self._renderers[w]
-        self._last_sig = None
+        self._glass = self._build_shell()
         self.resize(self.renderer.cw, self.renderer.ch)
 
     def toggle_sidebar(self):
         self.sidebar_open = not self.sidebar_open
         self._build_renderer()
-        self.refresh_glass()
-
-    # -- glass --------------------------------------------------------------
-
-    def _set_affinity(self, value):
-        """Hide this window from screen capture for the length of one grab,
-        so the glass never refracts itself into a feedback loop."""
-        try:
-            import ctypes
-            return bool(ctypes.windll.user32.SetWindowDisplayAffinity(
-                ctypes.c_void_p(int(self.winId())), ctypes.c_uint(value)))
-        except Exception:
-            return False
-
-    def refresh_glass(self, force=True):
-        w = self._w()
-        gw, gh = self.renderer.w, self.renderer.h
-        excluded = self._set_affinity(WDA_EXCLUDEFROMCAPTURE) \
-            if self.isVisible() else False
-        if self.isVisible() and not excluded:
-            return
-        try:
-            pos = self.pos()
-            backdrop = lg.grab_screen(pos.x() + PAD, pos.y() + PAD, gw, gh)
-        except Exception:
-            backdrop = None
-        finally:
-            if excluded:
-                self._set_affinity(WDA_NONE)
-        if backdrop is None or backdrop.shape[:2] != (gh, gw):
-            backdrop = np.full((gh, gw, 3), 18, dtype=np.uint8)
-
-        # the desktop behind is usually still; skip the 24 ms refraction when
-        # nothing moved and pay only the capture
-        sig = float(backdrop[::7, ::7].sum(dtype=np.float64))
-        # relative, not absolute: sig sums thousands of samples, so an
-        # absolute epsilon never matched and the skip never fired
-        if not force and self._last_sig is not None \
-                and abs(sig - self._last_sig) <= 3e-4 * max(sig, 1.0):
-            return
-        self._last_sig = sig
-
-        self._glass = self.renderer.glass_image_split(backdrop)
+        self._content = None
         self.update()
 
-    def hideEvent(self, event):
-        self.glass_timer.stop()
-        super().hideEvent(event)
+    # -- shell --------------------------------------------------------------
+
+    def _build_shell(self):
+        """The window's own surface, computed once and never again.
+
+        This used to refract the live desktop, which meant a screen grab and
+        a full refraction several times a second for as long as the window
+        was open - 454 kpx of it. What it bought was a sidebar that showed
+        the wallpaper through frosted glass. With the content pane opaque
+        that was the only place it still showed, and it is not worth a
+        permanent background job: the window now has no per-frame work at
+        all, and repaints only when something on it changes.
+
+        The renderer still draws the shell, just over a flat field instead of
+        the desktop. Refracting a uniform field yields a uniform field, so
+        what survives is exactly the part that never depended on the
+        backdrop - the rounded mask, the edge shading, the rim light and the
+        drop shadow. That is the window chrome, and it comes out free.
+        """
+        r = self.renderer
+        flat = np.full((r.h, r.w, 3), SHELL_LEVEL, dtype=np.uint8)
+        return r.glass_image_split(flat).copy()
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(0, self.refresh_glass)
-        self.glass_timer.start(GLASS_MS)
         self._t = 0.0
         self.anim.stop()
         self.anim.setStartValue(0.0)
@@ -244,7 +224,7 @@ class HistoryWindow(QWidget):
     def reload(self):
         self.week = self.store.recent_days(9)
         self.stats = self.store.day_stats(self.day)
-        self.update()
+        self._restyle()
 
     # -- hit targets --------------------------------------------------------
 
@@ -298,7 +278,7 @@ class HistoryWindow(QWidget):
         hit = self._hit(pos)
         if hit:
             self._pressed = hit
-            self.update()
+            self._restyle()
         elif pos.x() > PAD + self._sw() or pos.y() < PAD + 46:
             self._drag = event.globalPosition().toPoint() - self.pos()
 
@@ -317,10 +297,9 @@ class HistoryWindow(QWidget):
                     self.day = what
                     self.reload()
             self._pressed = None
-            self.update()
+            self._restyle()
         if self._drag is not None:
             self._drag = None
-            self.refresh_glass()
 
     def mouseMoveEvent(self, event):
         if self._drag is not None:
@@ -334,11 +313,11 @@ class HistoryWindow(QWidget):
         hover = hit[1] if hit and hit[0] == "day" else None
         if hover != self._hover or hot != self._lights_hot:
             self._hover, self._lights_hot = hover, hot
-            self.update()
+            self._restyle()
 
     def leaveEvent(self, event):
         self._hover, self._lights_hot = None, False
-        self.update()
+        self._restyle()
 
     # -- painting -----------------------------------------------------------
 
@@ -355,21 +334,38 @@ class HistoryWindow(QWidget):
         if self._glass is not None:
             p.drawImage(0, 0, self._glass)
 
-        p.translate(PAD, PAD)
+        p.drawImage(PAD, PAD, self._content_layer())
+        p.end()
+
+    def _content_layer(self):
+        """Everything above the glass, drawn once and kept.
+
+        The glass ticks many times a second because the desktop behind it
+        moves; the chart, the week list and the traffic lights do not. They
+        were being redrawn on every one of those ticks for nothing, which on
+        a window this size cost more than the refraction of the bezel. The
+        layer is dropped whenever something that is actually drawn into it
+        changes - see _restyle. The open animation is not one of those: it
+        scales the painter, which still applies to the cached image.
+        """
+        w = self._w()
+        if self._content is not None and self._content.width() == w:
+            return self._content
+
+        img = QImage(w, H, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
 
         sw = self._sw()
-        shell = pnl.squircle_path(QRectF(0, 0, self._w(), H), RADIUS)
+        shell = pnl.squircle_path(QRectF(0, 0, w, H), RADIUS)
         p.save()
         p.setClipPath(shell)
         # the detail pane is the floor; the sidebar floats above it, so the
         # shadow falls from the sidebar onto the detail, not the reverse
         p.fillRect(QRectF(sw, 0, DETAIL_W, H), DETAIL_FILL)
         if sw:
-            # short falloff: long enough to read as a cast shadow, short
-            # enough not to look like a smudge
-            for i in range(5):
-                a = int(42 * (1 - i / 5.0) ** 2)
-                p.fillRect(QRectF(sw + i, 0, 1, H), QColor(0, 0, 0, a))
             p.fillRect(QRectF(sw - 1, 0, 1, H), HAIRLINE)
             self._draw_sidebar(p)
         self._draw_detail(p, sw, 0, DETAIL_W, H)
@@ -379,10 +375,18 @@ class HistoryWindow(QWidget):
         self._draw_toggle(p)
         p.end()
 
+        self._content = img
+        return img
+
+    def _restyle(self):
+        """Something drawn into the content layer changed; rebuild and show."""
+        self._content = None
+        self.update()
+
     def _draw_toggle(self, p):
         r = QRectF(self._toggle_rect().translated(-PAD, -PAD))
         if self._pressed == ("toggle", None):
-            p.fillPath(pnl.squircle_path(r, 5), QColor(255, 255, 255, 30))
+            p.fillPath(pnl.squircle_path(r, 5), QColor(0, 0, 0, 22))
         colour = LABEL2 if self.sidebar_open else LABEL4
         glyph = pnl._icon("sidebar", colour, 15)
         p.drawImage(int(r.center().x() - 7), int(r.center().y() - 7), glyph)
@@ -447,13 +451,13 @@ class HistoryWindow(QWidget):
 
             p.setFont(_font("sidebar"))
             _text(p, rf.adjusted(11, 0, -50, 0), Qt.AlignLeft | Qt.AlignVCenter,
-                  name, LABEL if selected else LABEL2)
+                  name, ON_ACCENT if selected else LABEL2)
 
             dose = stats["dose"]
             p.setFont(_font("caption"))
             _text(p, rf.adjusted(0, 0, -11, 0), Qt.AlignRight | Qt.AlignVCenter,
                   i18n.percent(dose * 100) if dose > 0 else "--",
-                  LABEL if selected else
+                  ON_ACCENT if selected else
                   (dose_color(dose) if dose >= 0.5 else LABEL4))
 
         self._draw_bottom_bar(p)
@@ -466,7 +470,7 @@ class HistoryWindow(QWidget):
 
         dot = QRectF(18, top + bar_h / 2 - 3, 6, 6)
         p.setPen(Qt.NoPen)
-        p.setBrush(pnl.GREEN)
+        p.setBrush(OK_C)
         p.drawEllipse(dot)
         p.setBrush(Qt.NoBrush)
 
@@ -533,7 +537,7 @@ class HistoryWindow(QWidget):
         gw, gh = w - 28 - gutter, h - 64
 
         p.setFont(_font("caption"))
-        for level, colour in ((80.0, pnl.YELLOW), (95.0, pnl.RED)):
+        for level, colour in ((80.0, LOUD_C), (95.0, RISK_C)):
             ly = gy + gh - (level - lo) / (hi - lo) * gh
             pen = QPen(HAIRLINE, 1, Qt.DashLine)
             pen.setDashPattern([1, 3])
