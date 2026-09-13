@@ -18,7 +18,7 @@ applies a per-model loudness reference.
 - **Control Center style panel** — click the tray icon; real Liquid Glass,
   refracting the desktop behind it at ~60 fps
 - **Exposure window** — the day's levels, your share of the recommended daily
-  dose, and the last nine days
+  dose, and the last nine days, in a light window built like Finder
 - **Automatic model detection** — reads the Bluetooth product ID and picks the
   matching loudness reference
 - **English and French**, picked from your Windows display language

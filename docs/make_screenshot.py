@@ -66,9 +66,8 @@ def main():
 
     win = hw.HistoryWindow(store)
     win.timer.stop()
-    gw, gh = win.renderer.w, win.renderer.h
-    back = wallpaper(gw, gh).astype(np.float32)
-    win._glass = win.renderer.glass_image_split(back)
+    # the window builds its own shell once, over a flat field - it no longer
+    # refracts whatever is behind it, so there is nothing to feed it here
 
     small = pnl.PanelRenderer()
     sback = wallpaper(small.w, small.h).astype(np.float32)
