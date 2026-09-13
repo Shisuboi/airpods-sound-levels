@@ -16,7 +16,7 @@ applies a per-model loudness reference.
 
 - **Tray meter** — the current level in dB(A), coloured by tier, updated live
 - **Control Center style panel** — click the tray icon; real Liquid Glass,
-  refracting the desktop behind it at 30 fps
+  refracting the desktop behind it at ~60 fps
 - **Exposure window** — the day's levels, your share of the recommended daily
   dose, and the last nine days
 - **Automatic model detection** — reads the Bluetooth product ID and picks the

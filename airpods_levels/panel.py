@@ -396,6 +396,12 @@ class PanelRenderer:
         sh = self.shade[:self.h2 * 2, :self.w2 * 2]
         self.shade_half = sh.reshape(self.h2, 2, self.w2, 2).mean((1, 3))
 
+        # The scrim is applied twice: once as a darkening folded into `shade`,
+        # and once as a tone added back on top (see glass_image). The split
+        # renderer needs the add-back at both resolutions.
+        sc = self.scrim[:self.h2 * 2, :self.w2 * 2].astype(np.float32)
+        self.scrim_half = sc.reshape(self.h2, 2, self.w2, 2).mean((1, 3))
+
         # Write band: only pixels the displacement actually moves, i.e. the
         # bezel itself. Beyond it the field is zero and the half-res interior
         # is already correct.
@@ -423,6 +429,7 @@ class PanelRenderer:
                 "coords": cc,
                 "shade": self.shade[ys, xs, None].copy(),
                 "light": self.light[ys, xs, None].copy(),
+                "scrim": self.scrim[ys, xs, None].astype(np.float32),
                 "coef": self.coef255[ys, xs, None].copy(),
                 "shape": (ys.stop - ys.start, xs.stop - xs.start, 3),
                 # tint thinned towards the outer edge so the lens is visible
@@ -496,9 +503,24 @@ class PanelRenderer:
 
         keep = 1.0 - g["tint_alpha"]
         bias = tint_arr * g["tint_alpha"]
-        small *= g["brightness"] * keep
+        sat = g["saturation"]
+        if sat != 1.0:
+            luma = (0.2126 * small[..., 0] + 0.7152 * small[..., 1]
+                    + 0.0722 * small[..., 2])
+            luma *= (1.0 - sat) * g["brightness"] * keep
+            small *= sat * g["brightness"] * keep
+            small += luma[..., None]
+        else:
+            small *= g["brightness"] * keep
         small += bias
         small *= self.shade_half[..., None]
+
+        # the scrim has taken its share out of the image; put back a tone that
+        # goes dark over bright content and light over dark, so text keeps its
+        # contrast either way. Without this the text bands read as black holes.
+        target = g.get("scrim_light", 0.80) * (1.0 - polarity)
+        if target > 0.0:
+            small += self.scrim_half[..., None] * target
         small *= 255.0
         np.clip(small, 0, 255, out=small)
 
@@ -522,9 +544,18 @@ class PanelRenderer:
                                         order=1, mode="nearest",
                                         output=res[..., c])
             a = job["alpha"]
-            res *= g["brightness"] * (1.0 - a)
+            if sat != 1.0:
+                luma = (0.2126 * res[..., 0] + 0.7152 * res[..., 1]
+                        + 0.0722 * res[..., 2])[..., None]
+                luma *= (1.0 - sat) * g["brightness"] * (1.0 - a)
+                res *= sat * g["brightness"] * (1.0 - a)
+                res += luma
+            else:
+                res *= g["brightness"] * (1.0 - a)
             res += tint_arr * a
             res *= job["shade"]
+            if target > 0.0:
+                res += job["scrim"] * target
             res += job["light"]
             np.clip(res, 0.0, 1.0, out=res)
             res *= job["coef"]
