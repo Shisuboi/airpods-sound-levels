@@ -95,18 +95,31 @@ class History:
         start = datetime(day.year, day.month, day.day)
         return int(start.timestamp()), int((start + timedelta(days=1)).timestamp())
 
+    def _pending_row(self):
+        """What the still-accumulating minute would look like right now,
+        without committing it to the database or resetting the accumulator -
+        flushing here would make every subsequent read within the same
+        minute overwrite the row with only what's arrived since, shrinking
+        the totals instead of growing them."""
+        if self._count and self._bucket is not None:
+            leq = 10.0 * math.log10(self._energy / self._count)
+            return (self._bucket, leq, self._peak or leq, self._count)
+        return None
+
     def day_rows(self, day=None):
         """(minute, leq, peak, seconds) for one calendar day."""
         day = day or datetime.now().date()
         if isinstance(day, datetime):
             day = day.date()
         lo, hi = self._day_bounds(day)
-        # include the minute still being accumulated
-        self._flush()
         cur = self._conn.execute(
             "SELECT minute, leq, peak, seconds FROM minutes "
             "WHERE minute >= ? AND minute < ? ORDER BY minute", (lo, hi))
-        return cur.fetchall()
+        rows = list(cur.fetchall())
+        pending = self._pending_row()
+        if pending is not None and lo <= pending[0] < hi:
+            rows.append(pending)
+        return rows
 
     def day_stats(self, day=None):
         rows = self.day_rows(day)

@@ -44,44 +44,100 @@ TRAY_REFRESH_MS = 700
 LOG_MS = 1000             # one exposure sample per second
 MARGIN = 12
 
+# The Run registry key looked right on paper - a valid value plus a correct
+# Settings > Apps > Startup approval byte - and Explorer still silently never
+# invoked it, with no trace anywhere pythonw could report a crash. Pivoting
+# to a scheduled task didn't help either: schtasks refused *any* absolute
+# /TR path with "Access is denied" on this machine, confirmed straight from
+# an interactive terminal, unrelated to this app or its own process. A
+# Startup-folder shortcut sidesteps both: it is a plain file write to a
+# folder the user already owns, the same mechanism several other apps on
+# this machine already rely on successfully.
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "AirPodsSoundLevels"
 
 
-def autostart_command():
-    """pythonw on run.py: no console window, and the launcher puts the
-    project on sys.path itself, so the Run key needs no working directory."""
+def _startup_folder():
+    return os.path.join(os.environ["APPDATA"], "Microsoft", "Windows",
+                        "Start Menu", "Programs", "Startup")
+
+
+def _shortcut_path():
+    return os.path.join(_startup_folder(), APP_NAME + ".lnk")
+
+
+def _autostart_target():
+    """(exe, launcher): pythonw on run.py - no console window, and the
+    launcher puts the project on sys.path itself, so no working directory
+    needs to be set on the shortcut."""
     exe = sys.executable
     candidate = os.path.join(os.path.dirname(exe), "pythonw.exe")
     if os.path.exists(candidate):
         exe = candidate
     launcher = os.path.join(os.path.dirname(HERE), "run.py")
-    return '"{}" "{}"'.format(exe, launcher)
+    return exe, launcher
 
 
-def is_autostart():
+def _log(line):
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            return winreg.QueryValueEx(key, APP_NAME)[0] == autostart_command()
+        log_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                               "AirPodsSoundLevels")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "launch.log"), "a", encoding="utf-8") as fh:
+            import datetime
+            fh.write(datetime.datetime.now().isoformat(timespec="seconds")
+                     + " " + line + chr(10))
     except OSError:
-        return False
+        pass
 
 
-def set_autostart(on):
+def _remove_legacy_run_entry():
+    """One-time cleanup: delete the old Run-key registration this used to
+    use, so a stale entry never sits next to the shortcut."""
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                             winreg.KEY_SET_VALUE) as key:
-            if on:
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ,
-                                  autostart_command())
-            else:
-                try:
-                    winreg.DeleteValue(key, APP_NAME)
-                except OSError:
-                    pass
-        return True
+            winreg.DeleteValue(key, APP_NAME)
     except OSError:
+        pass
+    try:
+        subprocess.run(["schtasks", "/Delete", "/TN", APP_NAME, "/F"],
+                       capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
+        pass
+
+
+def is_autostart():
+    _remove_legacy_run_entry()
+    return os.path.exists(_shortcut_path())
+
+
+def set_autostart(on):
+    _remove_legacy_run_entry()
+    path = _shortcut_path()
+    if not on:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return True
+    try:
+        import comtypes.client
+        exe, launcher = _autostart_target()
+        shell = comtypes.client.CreateObject("WScript.Shell", dynamic=True)
+        shortcut = shell.CreateShortcut(path)
+        shortcut.TargetPath = exe
+        shortcut.Arguments = '"{}"'.format(launcher)
+        shortcut.WorkingDirectory = os.path.dirname(launcher)
+        shortcut.IconLocation = exe
+        shortcut.Save()
+        _log("shortcut created at {}".format(path))
+        return os.path.exists(path)
+    except Exception as exc:
+        _log("shortcut creation failed: {!r}".format(exc))
         return False
+
 
 OPEN_MS, CLOSE_MS = 280, 160
 
